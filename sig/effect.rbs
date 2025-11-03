@@ -1,0 +1,243 @@
+module Effect
+  class Context
+    attr_reader values: ::Hash[::Object, ::Object]
+
+    def initialize: (?::Hash[::Object, ::Object] values) -> void
+    def self.empty: () -> Context
+    def self.current: () -> Context
+    def self.with: (Context context) { () -> void } -> void
+    def self.provide: (::Object key, ::Object value) { () -> void } -> void
+    def []: (::Object key) -> ::Object
+    def fetch: (::Object key) -> ::Object
+    def provide: (::Object key, ::Object value) -> Context
+    def merge: (Context | ::Hash[::Object, ::Object]) -> Context
+    def to_h: () -> ::Hash[::Object, ::Object]
+  end
+
+  class Cause
+    attr_reader type: ::Symbol
+    attr_reader error: ::Object
+    attr_reader exception: ::Exception?
+    attr_reader backtrace: ::Array[::String]
+
+    def self.fail: (::Object error) -> Cause
+    def self.interrupt: (?::Object reason) -> Cause
+    def self.defect: (::Exception exception) -> Cause
+    def failure?: () -> bool
+    def interrupt?: () -> bool
+    def defect?: () -> bool
+    def message: () -> ::String
+  end
+
+  class Task[Out]
+    class Result[Out]
+      attr_reader status: ::Symbol
+      attr_reader value: Out
+      attr_reader cause: Cause
+
+      def self.success: (Out value) -> Result[Out]
+      def self.failure: (Cause cause) -> Result[Out]
+      def success?: () -> bool
+      def failure?: () -> bool
+      def value!: () -> Out
+    end
+
+    class ForkHandle[Out]
+      def await: () -> Result[Out]
+      def wait: () -> Result[Out]
+      def join: () -> Task[Result[Out]]
+    end
+
+    def initialize: () { (Effect::Runtime::Scope) -> Result[Out] } -> void
+
+    def self.succeed: (?Out value) -> Task[Out]
+    def self.fail: (::Object error) -> Task[::Object]
+    def self.from: () { () -> Out } -> Task[Out]
+    def map: () { (Out) -> Out } -> Task[Out]
+    def and_then: () { (Out) -> Task[Out] } -> Task[Out]
+    def rescue: (*::Class) { (Cause) -> Task[Out] } -> Task[Out]
+    def tap: () { (Out) -> ::Object } -> Task[Out]
+    def provide: (::Object key, ::Object value) -> Task[Out]
+    def provide_all: (::Hash[::Object, ::Object]) -> Task[Out]
+    def provide_context: (Context context) -> Task[Out]
+    def provide_layer: (Layer layer) -> Task[Out]
+    def fork: () -> Task[ForkHandle[Out]]
+    def retry: (Schedule schedule, ?retry_on: ::Object) -> Task[Out]
+    def run: (?Runtime runtime) -> Out
+    def result: (?Runtime runtime) -> Result[Out]
+
+    def self.access: (::Object key) -> Task[::Object]
+    def self.access_all: () -> Task[::Hash[::Object, ::Object]]
+    def self.defer: () { () -> ::Object } -> Task[::Proc]
+  end
+
+  class Runtime
+    class TaskFailure < ::StandardError
+      attr_reader cause: Cause
+    end
+
+    class Interrupt < ::StandardError
+      attr_reader cause: Cause
+    end
+
+    class Scheduler
+      def self.detect: () -> Scheduler
+      def run: () { () -> ::Object } -> ::Object
+      def async: () { () -> Task::Result[::Object] } -> Scheduler::Handle
+    end
+
+    class Scheduler::Handle
+      def await: () -> Task::Result[::Object]
+      def wait: () -> Task::Result[::Object]
+    end
+
+    class Scope
+      attr_reader runtime: Runtime
+      attr_reader scheduler: Scheduler
+      attr_reader context: Context
+
+      def run: (Task[::Object] task) -> Task::Result[::Object]
+      def success: (::Object value) -> Task::Result[::Object]
+      def failure: (Cause cause) -> Task::Result[::Object]
+      def defect: (::Exception) -> Task::Result[::Object]
+      def interrupt: (?::Object reason) -> Task::Result[::Object]
+      def with_context: (Context context) { () -> Task::Result[::Object] } -> Task::Result[::Object]
+      def spawn: (Task[::Object] task) -> Scheduler::Handle
+    end
+
+    attr_reader scheduler: Scheduler
+
+    def initialize: (?context: Context, ?scheduler: Scheduler) -> void
+    def run: (Task[::Object] task) -> ::Object
+    def run_result: (Task[::Object] task) -> Task::Result[::Object]
+    def with_context: (Context context) { () -> ::Object } -> ::Object
+
+    def self.default: () -> Runtime
+  end
+
+  class Layer
+    class Provision
+      attr_reader context: Context
+      attr_reader finalizers: ::Array[::Object]
+    end
+
+    def initialize: () { (Runtime::Scope) -> Task::Result[Provision] } -> void
+    def call: (Runtime::Scope scope) -> Task::Result[Provision]
+    def +: (Layer other) -> Layer
+    def provide_to: (Task[::Object]) -> Task[::Object]
+
+    def self.identity: () -> Layer
+    def self.from_value: (::Object key, ::Object value) -> Layer
+    def self.from_hash: (::Hash[::Object, ::Object]) -> Layer
+    def self.from_resource: (::Object key) { (Runtime::Scope) -> [::Object, ::Proc] } -> Layer
+    def self.stack: (*Layer layers) -> Layer
+    def self.apply_context: (Context base, Context | ::Hash[::Object, ::Object] addition) -> Context
+    def self.ensure_provision: (Provision | Context | ::Hash[::Object, ::Object]) -> Provision
+  end
+
+  class Schedule
+    include ::Enumerable[::Float]
+
+    def initialize: () { () -> ::Enumerator[::Float] } -> void
+    def enumerator: () -> ::Enumerator[::Float]
+    def limited: (::Integer limit) -> Schedule
+
+    def self.fixed: (::Numeric interval, ?limit: ::Integer) -> Schedule
+    def self.exponential: (::Numeric base, ?factor: ::Numeric, ?max: ::Numeric, ?limit: ::Integer) -> Schedule
+    def self.fibonacci: (?base: ::Numeric, ?limit: ::Integer) -> Schedule
+    def self.recursions: (::Integer limit) -> Schedule
+  end
+
+  class Stream
+    include ::Enumerable[::Object]
+
+    def initialize: () { () -> ::Enumerator[::Object] } -> void
+    def enumerator: () -> ::Enumerator[::Object]
+    def map: () { (::Object) -> ::Object } -> Stream
+    def filter: () { (::Object) -> bool } -> Stream
+    def chunk: (::Integer size) -> Stream
+    def flat_map: () { (::Object) -> ::Array[::Object] } -> Stream
+    def take: (::Integer limit) -> Stream
+    def zip: (Stream other) -> Stream
+    def to_task: () -> Task[::Array[::Object]]
+
+    def self.from_array: (::Array[::Object]) -> Stream
+    def self.repeat: (::Object value) -> Stream
+    def self.from_task: (Task[::Object] task) -> Stream
+    def self.merge: (*Stream streams) -> Stream
+  end
+
+  module Layers
+    module Logging
+      KEY: ::Symbol
+
+      def self.layer: (?level: ::Integer, ?io: ::IO, ?formatter: ::Proc, ?progname: ::String) -> Layer
+      def self.console: (?level: ::Integer) -> Layer
+      def self.null: () -> Layer
+      def self.log: (::Symbol level, ?::String message) { () -> ::String } -> Task[::String]
+      def self.info: (?::String message) { () -> ::String } -> Task[::String]
+      def self.warn: (?::String message) { () -> ::String } -> Task[::String]
+      def self.error: (?::String message) { () -> ::String } -> Task[::String]
+      def self.debug: (?::String message) { () -> ::String } -> Task[::String]
+    end
+
+    module HTTP
+      KEY: ::Symbol
+
+      def self.client: (base_uri: ::String, ?open_timeout: ::Numeric, ?read_timeout: ::Numeric, ?default_headers: ::Hash[::String, ::String]) -> Layer
+      def self.get: (::String path, ?headers: ::Hash[::String, ::String]) -> Task[::Net::HTTPResponse]
+      def self.post: (::String path, body: ::String, ?headers: ::Hash[::String, ::String]) -> Task[::Net::HTTPResponse]
+      def self.with_client: () { (HTTP::Client) -> ::Object } -> Task[::Object]
+
+      class Client
+        attr_reader base_uri: ::URI::Generic
+        attr_reader open_timeout: ::Numeric
+        attr_reader read_timeout: ::Numeric
+        attr_reader default_headers: ::Hash[::String, ::String]
+
+        def initialize: (::String base_uri, open_timeout: ::Numeric, read_timeout: ::Numeric, default_headers: ::Hash[::String, ::String]) -> void
+        def get: (::String path, ?headers: ::Hash[::String, ::String]) -> ::Net::HTTPResponse
+        def post: (::String path, body: ::String, ?headers: ::Hash[::String, ::String]) -> ::Net::HTTPResponse
+        def request: (::Class klass, ::String path, ?body: ::String, ?headers: ::Hash[::String, ::String]) -> ::Net::HTTPResponse
+      end
+    end
+
+    module Persistence
+      KEY: ::Symbol
+
+      def self.memory: (?seed: ::Hash[::Symbol, ::Array[::Hash[::Symbol, ::Object]]]) -> Layer
+      def self.with_store: () { (Persistence::MemoryStore) -> ::Object } -> Task[::Object]
+      def self.insert: (::Symbol table, ::Hash[::Symbol, ::Object] row) -> Task[::Hash[::Symbol, ::Object]]
+      def self.find: (::Symbol table) { (::Hash[::Symbol, ::Object]) -> bool } -> Task[::Hash[::Symbol, ::Object]?]
+      def self.all: (::Symbol table) -> Task[::Array[::Hash[::Symbol, ::Object]]]
+
+      class MemoryStore
+        def initialize: (?seed: ::Hash[::Symbol, ::Array[::Hash[::Symbol, ::Object]]]) -> void
+        def insert: (::Symbol table, ::Hash[::Symbol, ::Object] row) -> ::Hash[::Symbol, ::Object]
+        def find: (::Symbol table) { (::Hash[::Symbol, ::Object]) -> bool } -> ::Hash[::Symbol, ::Object]?
+        def all: (::Symbol table) -> ::Array[::Hash[::Symbol, ::Object]]
+      end
+    end
+  end
+
+  module Prelude
+    Task: Task[::Object]
+    Layer: Layer
+    Schedule: Schedule
+    Stream: Stream
+    Layers: Layers
+    Logging: Layers::Logging
+    HTTP: Layers::HTTP
+    Persistence: Layers::Persistence
+
+    def self.succeed: (?::Object value) -> Task[::Object]
+    def self.fail: (::Object error) -> Task[::Object]
+    def self.from: () { () -> ::Object } -> Task[::Object]
+    def self.access: (::Object key) -> Task[::Object]
+    def self.console_logger: (?level: ::Integer) -> Layer
+    def self.memory_store: (?seed: ::Hash[::Symbol, ::Array[::Hash[::Symbol, ::Object]]]) -> Layer
+    def self.fixed_schedule: (::Numeric interval, ?limit: ::Integer) -> Schedule
+    def self.exponential_schedule: (base: ::Numeric, ?factor: ::Numeric, ?max: ::Numeric, ?limit: ::Integer) -> Schedule
+    def self.runtime: () -> Runtime
+  end
+end
