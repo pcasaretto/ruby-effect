@@ -11,7 +11,7 @@ module Effect
     # Scheduler abstracts over the underlying async executor.
     class Scheduler
       def self.detect
-        if defined?(::Async::Task)
+        if Object.const_defined?(:Async) && Object.const_get(:Async).const_defined?(:Task)
           AsyncScheduler.new
         else
           InlineScheduler.new
@@ -54,12 +54,13 @@ module Effect
       end
     end
 
-    if defined?(::Async::Task)
+    if Object.const_defined?(:Async) && Object.const_get(:Async).const_defined?(:Task)
       # AsyncScheduler delegates to the async gem, giving us fiber-based concurrency.
       class AsyncScheduler < Scheduler
         def run(&block)
           result = nil
-          reactor = ::Async::Reactor.new
+          async = Object.const_get(:Async)
+          reactor = async.const_get(:Reactor).new
           reactor.async do |task|
             @root = task
             result = block.call

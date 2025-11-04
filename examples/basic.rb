@@ -1,33 +1,33 @@
+# typed: true
 # frozen_string_literal: true
 
 require_relative "../lib/effect"
 require "logger"
 
-include Effect::Prelude
+LOGGER_TAG = Effect::Typed.tag(:logger, Logger)
+STORE_TAG = Effect::Typed.tag(:persistence_store, Effect::Layers::Persistence::MemoryStore)
 
-UserLayer = Layer.stack(
-  Logging.console(level: Logger::INFO),
-  Persistence.memory(seed: {
-    users: [
-      { id: 1, name: "Ada" },
-      { id: 2, name: "Alan" }
-    ]
-  })
-)
+logging_layer = Effect::Layers::Logging.console(level: Logger::INFO)
+store_layer = Effect::Layers::Persistence.memory(seed: {
+  users: [
+    { id: 1, name: "Ada" },
+    { id: 2, name: "Alan" }
+  ]
+})
 
-find_user = ->(id) do
-  Task.access(:persistence_store).and_then do |store|
-    Task.from do
-      store.find(:users) { |row| row[:id] == id } || raise(KeyError, "missing user #{id}")
-    end
+program = Effect::Typed.service(STORE_TAG)
+  .map do |store|
+    store.find(:users) { |row| row[:id] == 1 } || raise(KeyError, "missing user 1")
   end
+
+program = Effect::Typed.provide(program, STORE_TAG, store_layer)
+
+program = program.and_then do |user|
+  Effect::Typed.service(LOGGER_TAG)
+    .tap { |logger| logger.info("loaded #{user[:name]}") }
+    .map { user }
 end
 
-program =
-  find_user.call(1)
-  .and_then do |user|
-    Logging.info { "loaded #{user[:name]}" }.map { user }
-  end
-  .provide_layer(UserLayer)
+program = Effect::Typed.provide(program, LOGGER_TAG, logging_layer)
 
-puts Effect::Runtime.default.run(program)
+puts Effect::Typed.run(program)

@@ -8,6 +8,7 @@ require_relative "effect/runtime"
 require_relative "effect/layer"
 require_relative "effect/schedule"
 require_relative "effect/stream"
+require_relative "effect/typed"
 require_relative "effect/layers"
 require_relative "effect/prelude"
 

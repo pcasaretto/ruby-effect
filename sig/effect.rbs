@@ -220,6 +220,53 @@ module Effect
     end
   end
 
+  module Typed
+    module Env
+      class Base
+      end
+
+      class Empty < Base
+      end
+
+      class Need[Tag, Rest] < Base
+      end
+
+      class Combine[Left, Right] < Base
+      end
+    end
+
+    class Tag[Value]
+      attr_reader key: ::Symbol
+      attr_reader type: ::Class[Value]
+    end
+
+    class Task[EnvReq, Out]
+      def initialize: (Effect::Task task) -> void
+      def effect: () -> Effect::Task
+      def map: [Mapped]
+        () { (Out) -> Mapped } -> Task[EnvReq, Mapped]
+      def and_then: [NextEnv, NextOut]
+        () { (Out) -> Task[NextEnv, NextOut] } -> Task[Env::Combine[EnvReq, NextEnv], NextOut]
+      def flat_map: [NextEnv, NextOut]
+        () { (Out) -> Task[NextEnv, NextOut] } -> Task[Env::Combine[EnvReq, NextEnv], NextOut]
+      def tap: () { (Out) -> void } -> Task[EnvReq, Out]
+    end
+
+    def self.tag: [Value] (::Symbol key, ::Class[Value] type) -> Tag[Value]
+    def self.service: [Value]
+      (Tag[Value] tag) -> Task[Env::Need[Tag[Value], Env::Empty], Value]
+    def self.succeed: [Out]
+      (Out value) -> Task[Env::Empty, Out]
+    def self.from: [Out]
+      () { () -> Out } -> Task[Env::Empty, Out]
+    def self.provide: [Value, RestEnv, Out]
+      (Task[Env::Need[Tag[Value], RestEnv], Out] task, Tag[Value] tag, Effect::Layer layer) -> Task[RestEnv, Out]
+    def self.to_effect: [EnvReq, Out]
+      (Task[EnvReq, Out] task) -> Effect::Task
+    def self.run: [Out]
+      (Task[Env::Empty, Out] task, ?Effect::Runtime runtime) -> Out
+  end
+
   module Prelude
     Task: Task[::Object]
     Layer: Layer
