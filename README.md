@@ -106,6 +106,8 @@ See the `examples/` directory for runnable snippets:
 - `basic.rb` – layering + persistence + logging.
 - `http_retry.rb` – HTTP client with retry schedule.
 - `streaming.rb` – using streams for batching and fan-in.
+- `typed_missing_dependency.rb` – Sorbet-annotated program demonstrating typed capability wiring.
+- `typed_missing_dependency_fail.rb` – intentionally fails Sorbet when a required capability is not provided.
 
 ## Why Rubyists Might Care
 
@@ -117,6 +119,81 @@ Effect-style programming answers a handful of pain points that show up in larger
 - **Deterministic resource lifecycles.** Layers model acquisition/release as part of the effect description. Finalizers always run in reverse order, which removes the “did we close that connection?” class of bugs.
 - **Testable effects.** Because a Task is just data until you `run` it, swapping a layer (say an in-memory persistence stub) or inspecting the result is trivial. No need for monkeypatching or setting up global doubles.
 - **Typed affordances when you want them.** RBS/Sorbet signatures track which capabilities are in scope so you can catch “missing dependency” issues at static-check time without giving up Ruby’s flexibility.
+
+### Sorbet-typed contexts
+
+Using Sorbet, you can tag dependencies with the type they must satisfy and have missing or
+ill-typed capabilities surface as failed tasks. The `Effect::Typed` helpers provide a thin
+wrapper over context access:
+
+```ruby
+# typed: true
+LOGGER = Effect::Typed.tag(:logger, Logger)
+
+program =
+  Effect::Typed.service(LOGGER)
+    .tap { |logger| logger.info("hello") }
+
+with_logger = Effect::Typed.provide(program, LOGGER, Effect::Layers::Logging.console)
+Effect::Typed.run(with_logger)
+```
+
+Run a focused typecheck to watch Sorbet reject a program that calls `run`
+without satisfying its environment:
+
+```bash
+bundle exec srb tc --no-config --dir lib --dir sig --dir examples --ignore sorbet/rbi
+```
+
+`examples/typed_missing_dependency_fail.rb` is intentionally incorrect—it
+invokes `Effect::Typed.run(Effect::Typed.service(LOGGER))`, so Sorbet reports
+that the task still needs the logger capability.
+
+See `examples/typed_missing_dependency.rb` for a runnable snippet and
+`test/typed_test.rb` for expectations around success and failure paths.
+
+To run Sorbet locally:
+
+```bash
+bundle install
+bundle exec srb tc
+```
+
+### On a DSL (for now)
+
+Effect TS gains a lot of ergonomics from generator syntax:
+
+```ts
+const program = Effect.gen(function* ($) {
+  const store = yield* $(UserRepo)
+  const user  = yield* $(Store.fetch(1))
+  yield* $(Logger.info(`loaded ${user.name}`))
+  return user
+})
+```
+
+We prototyped a Ruby analogue (`Effect::Typed::DSL.build do |fx| ... end`) that let you write
+imperative code:
+
+```ruby
+program = Effect::Typed::DSL.build do |fx|
+  store = fx.service(STORE_TAG)
+  user  = store.find(:users) { _1[:id] == 1 }
+  logger = fx.service(LOGGER_TAG)
+  fx.from { logger.info("loaded #{user[:name]}") }
+  user
+end
+```
+
+The challenge is Sorbet: to thread each capability request through the typed environment without
+running the task immediately, the DSL would need to build up a purely functional description. Our
+naïve attempt either evaluated `fx.service` eagerly (breaking laziness) or dropped into
+`T.untyped` casts to keep Sorbet happy—undoing the static guarantees the typed runtime gives us.
+
+Until we design a builder that keeps laziness and strong types (likely using a dedicated AST or
+fiber interpreter), we’ve shelved the DSL. For now the recommended style is to compose effects with
+`service`, `map`, `and_then`, and apply layers afterwards with `provide`, which keeps the code
+explicit and fully type-checked.
 
 ## Caveats
 
