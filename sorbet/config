@@ -1,4 +1,10 @@
---isolate-error-code=4043
---ignore=sorbet/rbi
+--dir
 lib
-sig
+--dir
+examples
+--ignore
+vendor
+--ignore
+.bundle
+--ignore
+tmp

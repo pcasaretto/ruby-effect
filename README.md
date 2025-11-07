@@ -1,202 +1,193 @@
-# Effect.rb (prototype)
+# Effect for Ruby (work-in-progress)
 
-This repository sketches a Ruby-flavoured port of [Effect](https://effect.website/). It keeps
-Effect's algebra of typed effects, structured concurrency, layers, and fiber-friendly
-ergonomics while leaning on Ruby idioms: blocks, dynamic typing, and Sorbet/RBS support.
+An experiment in bringing the ergonomics of [Effect-TS](https://effect.website/) to Ruby while staying friendly to the existing ecosystem. The goal is to make dependencies explicit, model errors as values, and catch missing dependencies at compile time with Sorbet.
 
-## Getting started
+## Core Ideas
+
+- **Effect values instead of immediate execution** – an `Effect::Effect` describes work that, when run, produces either a successful `Result` or a `Cause`.
+- **Compile-time dependency tracking** – Sorbet enforces that effects with unsatisfied dependencies cannot be run. `Effect[T.noreturn]` means ready to run, `Effect[UnsatisfiedDependencies]` means missing dependencies.
+- **Pipeline-style service access** – use `Effect.service(KEY)` to access dependencies, compose with `flat_map` for clean, type-safe code.
+- **Errors as data** – `Effect::Cause` captures structured failure information (tag, message, metadata, wrapped exception) so callers must observe unhappy paths.
+- **Composable wiring with `Layer`** – layers provide dependency implementations; tests can swap layers to isolate effects.
+- **Interop-first** – helper APIs let you wrap existing Ruby methods in effects or run effects imperatively so adoption can be incremental.
+
+## Quick Start
 
 ```ruby
-require "effect"
-include Effect::Prelude
+require_relative "lib/effect"
 
-UserRepo = Layer.stack(
-  console_logger,
-  memory_store(seed: { users: [{ id: 1, name: "Ada" }] })
+HttpGet = Effect::Effect.attempt(description: "http.get") do
+  # your IO here, just a dummy example
+  response = Net::HTTP.get(URI("https://example.com")) # raises? it's wrapped
+  response.force_encoding("UTF-8")
+end
+
+result = Effect::Runtime.run(HttpGet)
+
+result.fold(
+  on_failure: ->(cause) { warn "http failed: #{cause.to_h.inspect}" },
+  on_success: ->(body) { puts body }
 )
+```
 
-find_user = Task.access(:persistence_store).and_then do |store|
-  Task.from do
-    store.find(:users) { |row| row[:id] == 1 } || raise(KeyError, "missing user")
+## Making Dependencies Explicit
+
+Use `Effect.service(KEY)` to access dependencies in a pipeline style:
+
+```ruby
+TELEMETRY = Effect::DependencyKey.new(:telemetry)
+LOGGER = Effect::DependencyKey.new(:logger)
+
+Catalog = Effect::Effect.service(TELEMETRY).flat_map do |telemetry|
+  telemetry.call("catalog.fetch.started")
+
+  Effect::Effect.attempt do
+    product = { id: 42, name: "Widget" }
+    telemetry.call("catalog.fetch.finished", product)
+    product
   end
 end
 
-program =
-  find_user
-    .tap { |user| Logging.info { "loaded #{user[:name]}" } }
-    .provide_layer(UserRepo)
+logger_layer = Effect::Layer.from_hash({
+  LOGGER => ->(message, metadata = {}) { puts("#{message} #{metadata.inspect}") }
+})
 
-Runtime.default.run(program)
-```
-
-- `Task` describes effectful computations with `map`, `and_then`, `rescue`, `retry`, and
-  `fork` for fibers.
-- `Layer` composes environment provisioning with resource-safe finalizers.
-- `Schedule` drives retry/backoff logic.
-- `Stream` wraps lazy enumerators for pipelines and batching.
-
-## Runtime
-
-`Effect::Runtime` wraps a scheduler (inline threads by default, `async` gem when available).
-It supervises forked tasks, keeps contexts fiber-local, and exposes `run`/`run_result`.
-
-```ruby
-program = Task.from { :hello }.
-  fork.and_then { |handle| handle.join }.
-  map(&:value!)
-
-Runtime.default.run(program)
-# => :hello
-```
-
-## Layers and context
-
-Layers translate dependencies into context values. They compose left-to-right and clean up
-resources in reverse order.
-
-```ruby
-FetchUser = Layer.from_resource(:db) do
-  client = DB::Client.new(ENV.fetch("DATABASE_URL"))
-  [client, -> { client.close }]
+telemetry_layer = Effect::Layer.new(description: "telemetry") do |ctx|
+  logger = ctx.fetch(LOGGER)
+  {
+    TELEMETRY => ->(event, metadata = {}) { logger.call("[telemetry] #{event}", metadata) }
+  }
 end
 
-program = Task.access(:db).
-  and_then { |db| Task.from { db.get(42) } }.
-  provide_layer(FetchUser)
+product = Effect::Runtime.run(Catalog, layers: [logger_layer, telemetry_layer]).value!
 ```
 
-Prebuilt layers live under `Effect::Layers`:
-
-- `Layers::Logging.console` – structured logging via `Logger`.
-- `Layers::HTTP.client` – wrap `Net::HTTP` with a base URI.
-- `Layers::Persistence.memory` – simple in-memory repository (handy for tests).
-
-## Scheduling & retries
-
-`Effect::Schedule` builders (`fixed`, `exponential`, `fibonacci`) feed `Task#retry`.
+Tests remain easy by swapping layers:
 
 ```ruby
-fetch = Layers::HTTP.get("/users/42").
-  retry(Schedule.exponential(base: 0.1, max: 2.0, limit: 5), retry_on: [Timeout::Error])
+fake_calls = []
+
+fake_layer = Effect::Layer.from_hash({
+  TELEMETRY => ->(event, metadata = {}) { fake_calls << [event, metadata] }
+})
+
+Effect::Runtime.run(Catalog, layers: [fake_layer])
+
+assert_equal [["catalog.fetch.started", {}], ["catalog.fetch.finished", { id: 42, name: "Widget" }]], fake_calls
 ```
 
-## Streams
+## Error Handling
 
-Streams orchestrate lazy, potentially infinite data. They are built atop `Enumerator` and
-compose with `map`, `filter`, `chunk`, `merge`, and `zip`.
+Uncaught exceptions are converted into `Cause` values automatically:
 
 ```ruby
-Stream.from_array([1, 2, 3])
-  .map { |n| n * 2 }
-  .chunk(2)
-  .to_task
-  .run
-# => [[2, 4], [6]]
+danger = Effect::Effect.attempt { raise "boom" }
+result = Effect::Runtime.run(danger)
+
+if result.failure?
+  puts result.cause.tag        # => :exception
+  puts result.cause.message    # => "boom"
+  puts result.cause.metadata   # => { original_exception_class: "RuntimeError" }
+end
 ```
 
-## Types with RBS
+Define domain failures explicitly for clarity:
 
-`sig/effect.rbs` provides Sorbet/RBS signatures that approximate the effect typing model.
-Pair it with `steep` or `sorbet` to track capability usage in larger applications.
+```ruby
+NotFound = Effect::Cause.new(tag: :not_found, message: "Order missing")
+find_order = Effect::Effect.fail(NotFound)
+```
+
+Recover with `catch_all` (or `map_error` if you just want to tweak the cause):
+
+```ruby
+safe_find = find_order.catch_all do |cause|
+  Effect::Effect.succeed({ default: true, reason: cause.tag })
+end
+```
+
+## Interop Helpers
+
+- `Effect::Interop.effectify { ... }` – turn a plain Ruby block into an effect (exceptions captured as causes).
+- `Effect::Interop.run(effect)` – execute an effect from imperative code and leave the caller to decide how to handle the `Result`.
+- `Effect::Interop.run(effect).value!` – opt into raising on failure explicitly (useful at top-level boundaries).
+- `Effect::Interop.with_context(logger: fake_logger) { ... }` – temporarily enrich the thread-local context when mixing effectful and legacy code paths.
+
+These escape hatches let you introduce effects at the edges (HTTP calls, background jobs) and wire them back into the rest of the application without large refactors.
 
 ## Examples
 
-See the `examples/` directory for runnable snippets:
+- `examples/explicit_dependencies.rb` – show how effects surface dependencies so tests can supply fakes.
+- `examples/pipeline_style.rb` – demonstrate clean composition with `Effect.service()` and `flat_map`.
+- `examples/failing_missing_dependency.rb` – see how Sorbet catches missing dependencies at compile time.
+- `examples/telemetry_extension.rb` – add telemetry around an existing effect without touching its body.
+- `examples/error_handling.rb` – demonstrate turning exceptions into causes and recovering explicitly.
+- `examples/interop.rb` – integrate effects with legacy Ruby controllers and renderers.
+- `examples/catalog.rb` – end-to-end sample combining logging, telemetry, and domain logic.
 
-- `basic.rb` – layering + persistence + logging.
-- `http_retry.rb` – HTTP client with retry schedule.
-- `streaming.rb` – using streams for batching and fan-in.
-- `typed_missing_dependency.rb` – Sorbet-annotated program demonstrating typed capability wiring.
-- `typed_missing_dependency_fail.rb` – intentionally fails Sorbet when a required capability is not provided.
-
-## Why Rubyists Might Care
-
-Effect-style programming answers a handful of pain points that show up in larger Ruby systems:
-
-- **Explicit dependency wiring.** Layers let you describe dependencies declaratively and pass them through the call graph without parameter soup or global state. Instead of sprinkling `Thread.current[:foo]` or memoized singletons, you compose `Layer`s alongside the code that needs them.
-- **Structured async without callback gymnastics.** Tasks compose like plain data while still running on fibers/threads under the hood. That gives you `fork`, `retry`, and supervision trees without juggling raw `Fiber` objects or building bespoke lifecycle code.
-- **Predictable error handling.** Every effect either succeeds with a value or fails with a structured `Cause`. Recoveries live next to the call sites via `Task#rescue`, making fallbacks discoverable and testable—no hidden `rescue nil` or swallowed stack traces.
-- **Deterministic resource lifecycles.** Layers model acquisition/release as part of the effect description. Finalizers always run in reverse order, which removes the “did we close that connection?” class of bugs.
-- **Testable effects.** Because a Task is just data until you `run` it, swapping a layer (say an in-memory persistence stub) or inspecting the result is trivial. No need for monkeypatching or setting up global doubles.
-- **Typed affordances when you want them.** RBS/Sorbet signatures track which capabilities are in scope so you can catch “missing dependency” issues at static-check time without giving up Ruby’s flexibility.
-
-### Sorbet-typed contexts
-
-Using Sorbet, you can tag dependencies with the type they must satisfy and have missing or
-ill-typed capabilities surface as failed tasks. The `Effect::Typed` helpers provide a thin
-wrapper over context access:
-
-```ruby
-# typed: true
-LOGGER = Effect::Typed.tag(:logger, Logger)
-
-program =
-  Effect::Typed.service(LOGGER)
-    .tap { |logger| logger.info("hello") }
-
-with_logger = Effect::Typed.provide(program, LOGGER, Effect::Layers::Logging.console)
-Effect::Typed.run(with_logger)
-```
-
-Run a focused typecheck to watch Sorbet reject a program that calls `run`
-without satisfying its environment:
+Run any script directly, e.g.:
 
 ```bash
-bundle exec srb tc --no-config --dir lib --dir sig --dir examples --ignore sorbet/rbi
+ruby examples/catalog.rb
+ruby examples/pipeline_style.rb
 ```
 
-`examples/typed_missing_dependency_fail.rb` is intentionally incorrect—it
-invokes `Effect::Typed.run(Effect::Typed.service(LOGGER))`, so Sorbet reports
-that the task still needs the logger capability.
+## Tests
 
-See `examples/typed_missing_dependency.rb` for a runnable snippet and
-`test/typed_test.rb` for expectations around success and failure paths.
+```bash
+ruby -Itest test/effect_test.rb
+```
 
-To run Sorbet locally:
+## Static Check
+
+[Sorbet](https://sorbet.org) catches missing dependencies at compile time using phantom types. Run:
 
 ```bash
 bundle install
-bundle exec srb tc
+bin/effect_check   # wraps `bundle exec srb tc`
 ```
 
-### On a DSL (for now)
+Sorbet enforces that:
 
-Effect TS gains a lot of ergonomics from generator syntax:
+- **Effects with unsatisfied dependencies cannot be run** – `Effect.service(KEY)` returns `Effect[UnsatisfiedDependencies]`, which `Runtime.run` rejects. You must call `provide_layer` to transform it to `Effect[T.noreturn]` before running.
+- **Dependencies are type-safe** – dependency keys are typed `Effect::DependencyKey` constants, preventing raw symbol usage.
+- **Errors must be handled** – `Runtime.run` returns `Effect::Result`, forcing you to `fold`, `value!`, or otherwise acknowledge the failure channel.
 
-```ts
-const program = Effect.gen(function* ($) {
-  const store = yield* $(UserRepo)
-  const user  = yield* $(Store.fetch(1))
-  yield* $(Logger.info(`loaded ${user.name}`))
-  return user
-})
-```
+Wire it into CI to block merges that ignore errors or skip wiring a dependency.
 
-We prototyped a Ruby analogue (`Effect::Typed::DSL.build do |fx| ... end`) that let you write
-imperative code:
+### See the Failure
+
+`examples/failing_missing_dependency.rb` intentionally tries to run an effect with unsatisfied dependencies:
 
 ```ruby
-program = Effect::Typed::DSL.build do |fx|
-  store = fx.service(STORE_TAG)
-  user  = store.find(:users) { _1[:id] == 1 }
-  logger = fx.service(LOGGER_TAG)
-  fx.from { logger.info("loaded #{user[:name]}") }
-  user
+# ❌ BROKEN: This fails type checking
+sig { returns(Effect::Result) }
+def self.run_without_logger_layer
+  # ERROR: Expected Effect[T.noreturn], got Effect[UnsatisfiedDependencies]
+  Effect::Runtime.run(effect_with_unsatisfied_deps, layers: [])
+end
+
+# ✅ FIXED: Provide the LOGGER dependency using provide_layer
+sig { returns(Integer) }
+def self.run_with_logger_layer
+  logger_layer = Effect::Layer.from_hash({
+    LOGGER => ->(message, metadata) { puts "[LOG] #{message}" }
+  })
+
+  # provide_layer satisfies dependencies: Effect[UnsatisfiedDependencies] → Effect[T.noreturn]
+  effect_with_logger = effect_with_unsatisfied_deps.provide_layer(logger_layer)
+
+  # Now Runtime.run accepts it!
+  result = Effect::Runtime.run(effect_with_logger, layers: [])
+  result.value!
 end
 ```
 
-The challenge is Sorbet: to thread each capability request through the typed environment without
-running the task immediately, the DSL would need to build up a purely functional description. Our
-naïve attempt either evaluated `fx.service` eagerly (breaking laziness) or dropped into
-`T.untyped` casts to keep Sorbet happy—undoing the static guarantees the typed runtime gives us.
+Running `bundle exec srb tc` highlights the type error, showing the guardrails in action.
 
-Until we design a builder that keeps laziness and strong types (likely using a dedicated AST or
-fiber interpreter), we’ve shelved the DSL. For now the recommended style is to compose effects with
-`service`, `map`, `and_then`, and apply layers afterwards with `provide`, which keeps the code
-explicit and fully type-checked.
+## Next Steps
 
-## Caveats
-
-This is a prototype. Concurrency semantics are conservative, finalizer errors surface as
-defects, and extensive effect combinators (race, structured scheduling) remain to be built.
-The goal is to spark exploration, not provide a production-ready runtime.
+- Flesh out a richer algebra (parallelism, retries, scheduling) on top of the current primitives.
+- Explore integration with Rack/Rails through middleware that populates the runtime context automatically.
+- Design Sorbet/RBS signatures so typed projects can get coverage on context keys and effect shapes.
+- Add structured logging/tracing layers to show stronger telemetry benefits.

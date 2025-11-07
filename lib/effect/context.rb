@@ -1,73 +1,93 @@
-# frozen_string_literal: true
+# typed: true
 
 module Effect
-  # Context models the fiber-local environment Thread used for dependency injection.
   class Context
-    attr_reader :values
+    extend T::Sig
 
-    def initialize(values = {})
-      @values = values.freeze
-    end
+    THREAD_KEY = :__effect_runtime_context
 
     def self.empty
-      @empty ||= new
+      @empty ||= new({})
+    end
+
+    def self.from_hash(entries)
+      new(entries)
     end
 
     def self.current
-      store = local_store
-      store[:effect_context] ||= empty
+      Thread.current[THREAD_KEY] || empty
     end
 
-    def self.with(context)
-      store = local_store
-      previous = store[:effect_context] || empty
-      store[:effect_context] = context
+    def self.use(context)
+      previous = Thread.current[THREAD_KEY]
+      Thread.current[THREAD_KEY] = context
       yield
     ensure
-      store[:effect_context] = previous
+      Thread.current[THREAD_KEY] = previous
     end
 
-    def self.provide(key, value)
-      with(current.provide(key, value)) { yield }
+    sig { returns(T::Hash[DependencyKey, T.untyped]) }
+    attr_reader :entries
+
+    sig { params(entries: T::Hash[T.any(DependencyKey, Symbol, String), T.untyped]).void }
+    def initialize(entries)
+      coerced = entries.each_with_object({}) do |(key, value), memo|
+        dep_key = DependencyKey === key ? key : DependencyKey.new(key)
+        memo[dep_key] = value
+      end
+      @entries = T.let(coerced.freeze, T::Hash[DependencyKey, T.untyped])
     end
 
-    def [](key)
-      @values[key]
+    sig do
+      params(
+        key: DependencyKey,
+        block: T.nilable(T.proc.params(arg0: DependencyKey).returns(T.untyped))
+      ).returns(T.untyped)
+    end
+    def fetch(key, &block)
+      if entries.key?(key)
+        entries[key]
+      elsif block
+        block.call(key)
+      else
+        raise KeyError, "Missing context key: #{key.name}"
+      end
     end
 
-    def fetch(key)
-      return @values.fetch(key) if @values.key?(key)
-
-      raise KeyError, "missing context value for #{key.inspect}"
+    sig { params(key: T.any(DependencyKey, Symbol, String)).returns(T::Boolean) }
+    def key?(key)
+      entries.key?(normalize_key(key))
     end
 
-    def provide(key, value)
-      Context.new(@values.merge(key => value))
+    sig { params(key: T.any(DependencyKey, Symbol, String), value: T.untyped).returns(Context) }
+    def with(key, value)
+      normalized = normalize_key(key)
+      self.class.new(entries.merge(normalized => value))
     end
 
     def merge(other)
       case other
       when Context
-        Context.new(@values.merge(other.values))
+        self.class.new(entries.merge(other.entries))
       when Hash
-        Context.new(@values.merge(other))
+        additions = other.transform_keys { |key| normalize_key(key) }
+        self.class.new(entries.merge(additions))
       else
-        raise ArgumentError, "cannot merge context with #{other.class}"
+        raise ArgumentError, "Cannot merge #{other.class} into Context"
       end
     end
 
     def to_h
-      @values.dup
+      entries.dup
     end
 
-    def self.local_store
-      fiber = defined?(Fiber) && Fiber.respond_to?(:current) ? Fiber.current : nil
-      if fiber && fiber.respond_to?(:[]) && fiber.respond_to?(:[]=)
-        fiber
-      else
-        Thread.current
-      end
+    private
+
+    sig { params(key: T.any(DependencyKey, Symbol, String)).returns(DependencyKey) }
+    def normalize_key(key)
+      return key if key.is_a?(DependencyKey)
+
+      DependencyKey.new(key)
     end
-    private_class_method :local_store
   end
 end

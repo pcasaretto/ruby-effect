@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "English"
+
+cmd = ["shadowenv", "exec", "--", "bundle", "exec", "srb", "tc"]
+cmd.concat(ARGV)
+
+success = system(*cmd)
+exit(success ? 0 : ($CHILD_STATUS&.exitstatus || 1))

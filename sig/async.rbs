@@ -1,7 +1,0 @@
-module Async
-  class Task
-  end
-
-  class Reactor
-  end
-end

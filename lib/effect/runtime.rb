@@ -1,74 +1,72 @@
-# frozen_string_literal: true
-
-require_relative "runtime/scheduler"
-require_relative "runtime/scope"
+# typed: true
 
 module Effect
-  class Runtime
-    class TaskFailure < StandardError
-      attr_reader :cause
+  module Runtime
+    extend T::Sig
+    module_function
 
-      def initialize(cause)
-        super(cause.message)
-        @cause = cause
+    sig do
+      params(
+        effect: ::Effect::Effect[T.noreturn],
+        layers: T::Array[::Effect::Layer],
+        context: T.nilable(::Effect::Context),
+        raise_on_error: T::Boolean
+      ).returns(::Effect::Result)
+    end
+    def run(effect, layers: [], context: Context.current, raise_on_error: false)
+      unless effect.respond_to?(:run)
+        return Result.failure(
+          Cause.new(tag: :invalid_effect, message: "Runtime.run expected an Effect, got #{effect.inspect}")
+        )
+      end
+
+      resolve_layers(Kernel.Array(layers), context).flat_map do |layered_context|
+        Context.use(layered_context) do
+          result = effect.run(layered_context)
+          if raise_on_error && result.failure?
+            Kernel.raise FailureError.new(result.cause)
+          end
+          result
+        end
       end
     end
 
-    class Interrupt < StandardError
-      attr_reader :cause
+    sig do
+      params(
+        effect: ::Effect::Effect[T.noreturn],
+        layers: T::Array[::Effect::Layer],
+        context: T.nilable(::Effect::Context)
+      ).returns(T.untyped)
+    end
+    def run!(effect, layers: [], context: Context.current)
+      run(effect, layers: layers, context: context, raise_on_error: true).value!
+    end
 
-      def initialize(cause)
-        super(cause.message)
-        @cause = cause
+    sig do
+      params(
+        effect: ::Effect::Effect[T.noreturn],
+        hash: T::Hash[::Effect::DependencyKey, T.untyped]
+      ).returns(::Effect::Result)
+    end
+    def provide_context(effect, hash)
+      run(effect.provide(hash))
+    end
+
+    sig do
+      params(
+        layers: T::Array[::Effect::Layer],
+        context: ::Effect::Context
+      ).returns(::Effect::Result)
+    end
+    def resolve_layers(layers, context)
+      layers.reduce(Result.success(context)) do |acc, layer|
+        acc.flat_map do |current_ctx|
+          layer.build(current_ctx).map do |provided_ctx|
+            current_ctx.merge(provided_ctx)
+          end
+        end
       end
     end
-
-    attr_reader :scheduler
-
-    def initialize(context: Context.empty, scheduler: nil)
-      @context = context
-      @scheduler = scheduler || Scheduler.detect
-    end
-
-    def run(task)
-      result = run_result(task)
-      return result.value if result.success?
-
-      raise_failure(result.cause)
-    end
-
-    def run_result(task)
-      result = nil
-      @scheduler.run do
-        scope = Scope.new(runtime: self, context: @context, scheduler: @scheduler)
-        result = scope.run(task)
-      end
-      result
-    end
-
-    def with_context(context)
-      previous = @context
-      @context = context
-      yield
-    ensure
-      @context = previous
-    end
-
-    def self.default
-      @default ||= new
-    end
-
-    private
-
-    def raise_failure(cause)
-      case cause.type
-      when :defect
-        raise cause.exception
-      when :interrupt
-        raise Interrupt.new(cause)
-      else
-        raise TaskFailure.new(cause)
-      end
-    end
+    private_class_method :resolve_layers
   end
 end

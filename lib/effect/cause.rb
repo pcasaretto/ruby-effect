@@ -1,56 +1,75 @@
-# frozen_string_literal: true
+# typed: true
 
 module Effect
-  # Cause captures the structured failure semantics for a task.
+  class FailureError < StandardError
+    attr_reader :cause
+
+    def initialize(cause)
+      @cause = cause
+      super(cause.message || cause.tag.to_s)
+      set_backtrace(cause.trace || [])
+    end
+  end
+
   class Cause
-    attr_reader :type, :error, :exception, :backtrace
+    attr_reader :tag, :message, :metadata, :exception, :trace
 
-    def initialize(type:, error: nil, exception: nil, backtrace: nil)
-      @type = type
-      @error = error
+    def self.exception(exception, tag: :exception, message: nil, metadata: {})
+      new(
+        tag: tag,
+        message: message || exception.message,
+        metadata: metadata.merge(original_exception_class: exception.class.name),
+        exception: exception,
+        trace: exception.backtrace
+      )
+    end
+
+    def initialize(tag:, message: nil, metadata: {}, exception: nil, trace: caller)
+      @tag = tag
+      @message = message
+      @metadata = metadata.freeze
       @exception = exception
-      @backtrace = Array(backtrace || exception&.backtrace)
+      @trace = trace
     end
 
-    def self.fail(error)
-      new(type: :failure, error: error)
+    def to_h
+      {
+        tag: tag,
+        message: message,
+        metadata: metadata,
+        exception: exception&.class&.name,
+        trace: trace
+      }
     end
 
-    def self.interrupt(reason = nil)
-      new(type: :interrupt, error: reason)
+    def enrich(additional_metadata = {})
+      Cause.new(
+        tag: tag,
+        message: message,
+        metadata: metadata.merge(additional_metadata),
+        exception: exception,
+        trace: trace
+      )
     end
 
-    def self.defect(exception)
-      new(type: :defect, exception: exception, backtrace: exception.backtrace)
+    def with_tag(new_tag)
+      Cause.new(
+        tag: new_tag,
+        message: message,
+        metadata: metadata,
+        exception: exception,
+        trace: trace
+      )
     end
 
-    def failure?
-      type == :failure
-    end
-
-    def interrupt?
-      type == :interrupt
-    end
-
-    def defect?
-      type == :defect
-    end
-
-    def message
-      case type
-      when :failure
-        "failure: #{error.inspect}"
-      when :interrupt
-        "interrupt: #{error.inspect}"
-      when :defect
-        "defect: #{exception.class}: #{exception.message}"
-      else
-        type.to_s
-      end
-    end
-
-    def to_s
-      message
+    def with_message(new_message)
+      Cause.new(
+        tag: tag,
+        message: new_message,
+        metadata: metadata,
+        exception: exception,
+        trace: trace
+      )
     end
   end
 end

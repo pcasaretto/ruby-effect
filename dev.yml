@@ -1,9 +1,0 @@
-name: effect
-
-dev.edition: 2024
-
-nix: true
-
-up:
-  - ruby
-  - bundler

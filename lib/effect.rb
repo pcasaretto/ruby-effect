@@ -1,17 +1,12 @@
-# frozen_string_literal: true
+# typed: true
 
-require_relative "effect/version"
+require "sorbet-runtime"
+
+require_relative "effect/dependency_key"
 require_relative "effect/context"
+require_relative "effect/result"
 require_relative "effect/cause"
-require_relative "effect/task"
-require_relative "effect/runtime"
 require_relative "effect/layer"
-require_relative "effect/schedule"
-require_relative "effect/stream"
-require_relative "effect/typed"
-require_relative "effect/layers"
-require_relative "effect/prelude"
-
-module Effect
-  # Namespace placeholder so require order doesn't matter when users `include Effect`.
-end
+require_relative "effect/effect"
+require_relative "effect/runtime"
+require_relative "effect/interop"
